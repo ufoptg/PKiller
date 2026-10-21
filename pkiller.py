@@ -7,6 +7,7 @@ import threading
 import time
 import argparse
 import glob
+import zipfile
 from termcolor import colored
 
 stop_spinner = False
@@ -167,20 +168,16 @@ def create_keystore(keystore_path):
     
     return run_with_spinner(keytool_cmd, "Keystore created", "Failed to create keystore")
 
-def sign_apk(apk_path):
-    print(colored("\n[5/5] Signing APK...", "white"))
-    
-    keystore_path = os.path.join(os.environ.get('PREFIX', '/data/data/com.termux/files/usr'), 
-                                'share', 'PKiller', 'key', 'PKiller.keystore')
-    
-    if not os.path.exists(keystore_path):
-        if not create_keystore(keystore_path):
-            print(colored("[-] Cannot proceed without keystore", "red"))
-            return None
-    
-    signed_apk = apk_path.replace('.apk', '_signed.apk')
-    
-    cmd = [
+def get_keystore():
+    return os.path.join(os.environ.get('PREFIX', '/data/data/com.termux/files/usr'), 
+                        'share', 'PKiller', 'key', 'PKiller.keystore')
+
+def signed_name(apk_path):
+    root, _ = os.path.splitext(apk_path)
+    return root + '_signed.apk'
+
+def apksigner_cmd(keystore_path, signed_apk, apk_path):
+    return [
         'apksigner', 'sign',
         '--ks', keystore_path,
         '--ks-pass', 'pass:pkiller',
@@ -189,10 +186,100 @@ def sign_apk(apk_path):
         '--out', signed_apk,
         apk_path
     ]
+
+def sign_apk(apk_path):
+    print(colored("\n[5/5] Signing APK...", "white"))
+    
+    keystore_path = get_keystore()
+    
+    if not os.path.exists(keystore_path):
+        if not create_keystore(keystore_path):
+            print(colored("[-] Cannot proceed without keystore", "red"))
+            return None
+    
+    signed_apk = signed_name(apk_path)
+    cmd = apksigner_cmd(keystore_path, signed_apk, apk_path)
     
     if run_with_spinner(cmd, "APK signed", "Sign failed"):
         return signed_apk
     return None
+
+def sign_splits(splits):
+    print(colored("\nSigning bundle splits...", "white"))
+    for split in splits:
+        split_name = os.path.basename(split)
+        cmd = apksigner_cmd(get_keystore(), signed_name(split), split)
+        if not run_with_spinner(cmd, f"Signed {split_name}", f"Failed to sign {split_name}"):
+            return False
+    return True
+
+def extract_bundle(bundle_path, output_dir):
+    print(colored("\nExtracting bundle...", "white"))
+    if not os.path.exists(bundle_path):
+        print(colored(f"[-] File not found: {bundle_path}", "red"))
+        return None, []
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    try:
+        bundle_root = os.path.realpath(output_dir)
+        with zipfile.ZipFile(bundle_path) as z:
+            for name in z.namelist():
+                dest = os.path.realpath(os.path.join(output_dir, name))
+                if dest != bundle_root and not dest.startswith(bundle_root + os.sep):
+                    raise zipfile.BadZipFile(f"Unsafe path in bundle: {name}")
+            z.extractall(output_dir)
+    except zipfile.BadZipFile as e:
+        print(colored(f"[-] Invalid bundle: {e}", "red"))
+        shutil.rmtree(output_dir, ignore_errors=True)
+        return None, []
+    
+    apk_files = sorted(glob.glob(os.path.join(output_dir, '**', '*.apk'), recursive=True))
+    if not apk_files:
+        print(colored("[-] No APK files found inside bundle", "red"))
+        return None, []
+    
+    base_apk = next((p for p in apk_files if os.path.basename(p).lower() == 'base.apk'), None)
+    if base_apk:
+        splits = [p for p in apk_files if p != base_apk]
+        return base_apk, splits
+    
+    apk_files.sort(key=os.path.getsize, reverse=True)
+    base_apk = apk_files[0]
+    print(colored(f"[*] No base.apk found, using largest APK as base: "
+                  f"{os.path.basename(base_apk)}", "white"))
+    return base_apk, apk_files[1:]
+
+def repack_bundle(bundle_dir, base_apk, base_signed, output_path):
+    print(colored("\nRepacking bundle...", "white"))
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    
+    apk_files = sorted(glob.glob(os.path.join(bundle_dir, '**', '*.apk'), recursive=True))
+    if not apk_files:
+        print(colored("[-] No APK files found in bundle", "red"))
+        return False
+    
+    spinner_thread = start_spinner()
+    try:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for apk in apk_files:
+                arcname = os.path.relpath(apk, bundle_dir).replace(os.sep, '/')
+                if apk == base_apk:
+                    zout.write(base_signed, arcname)
+                    continue
+                if arcname.endswith('_signed.apk'):
+                    continue
+                signed = signed_name(apk)
+                zout.write(signed if os.path.exists(signed) else apk, arcname)
+    except Exception as e:
+        stop_spinner_thread()
+        print(colored(f"[-] Repack failed: {str(e)}", "red"))
+        return False
+    stop_spinner_thread()
+    print(colored("[+] Bundle repacked", "green"))
+    return True
 
 def cleanup_files(output_apk=None):
     print(colored("\nCleaning up...", "white"))
@@ -207,14 +294,21 @@ def cleanup_files(output_apk=None):
     if os.path.exists('decoded_temp'):
         shutil.rmtree('decoded_temp')
     
+    if os.path.exists('bundle_temp'):
+        shutil.rmtree('bundle_temp')
+    
     temp_apk = os.path.join(os.getcwd(), "temp_rebuilt.apk")
     if os.path.exists(temp_apk) and (not output_apk or temp_apk != output_apk):
         os.remove(temp_apk)
+    
+    temp_signed = os.path.join(os.getcwd(), "temp_rebuilt_signed.apk")
+    if os.path.exists(temp_signed) and (not output_apk or temp_signed != output_apk):
+        os.remove(temp_signed)
 
 def main():
     show_banner()
     
-    parser = argparse.ArgumentParser(description='Remove PairIP license from APK', 
+    parser = argparse.ArgumentParser(description='Remove PairIP license from APK / .apks bundle', 
                                    add_help=False)
     parser.add_argument('apk_path', help='Path to the APK file', nargs='?')
     parser.add_argument('-o', '--output', help='Output APK filename')
@@ -224,15 +318,18 @@ def main():
     
     if args.help or not args.apk_path:
         print(colored("Usage:", "white"))
-        print(colored(f"  {script_name} <apk_file> [-o output.apk]", "green"))
+        print(colored(f"  {script_name} <apk_file | apks_bundle> [-o output]", "green"))
         print(colored("\nExamples:", "white"))
         print(colored(f"  {script_name} myapp.apk", "green"))
+        print(colored(f"  {script_name} bundle.apks", "green"))
         print(colored(f"  {script_name} myapp.apk -o patched_app.apk", "green"))
         print(colored(f"  {script_name} myapp.apk --output custom_name.apk", "green"))
-        print(colored("\nDefault output: <original_name>_pairip_killed.apk", "cyan"))
+        print(colored("\nDefault output: <original_name>_pairip_killed.apk "
+                      "(or .apks for bundles)", "cyan"))
         sys.exit(0)
     
     input_apk = args.apk_path
+    is_bundle = input_apk.lower().endswith('.apks')
     
     if not os.path.exists(input_apk):
         print(colored(f"\n[-] File not found: {input_apk}", "red"))
@@ -242,20 +339,31 @@ def main():
         sys.exit(1)
     
     # Determine output filename
+    output_ext = '.apks' if is_bundle else '.apk'
     if args.output:
         output_apk = args.output
-        # Ensure .apk extension
-        if not output_apk.lower().endswith('.apk'):
-            output_apk += '.apk'
+        # Ensure proper extension
+        if not output_apk.lower().endswith(output_ext):
+            output_apk += output_ext
         output_apk = os.path.join(os.getcwd(), output_apk)
     else:
         base_name = os.path.splitext(os.path.basename(input_apk))[0]
-        output_apk = os.path.join(os.getcwd(), f"{base_name}_pairip_killed.apk")
+        output_apk = os.path.join(os.getcwd(), f"{base_name}_pairip_killed{output_ext}")
     
+    bundle_dir = os.path.join(os.getcwd(), "bundle_temp")
     decoded_dir = "decoded_temp"
     
     try:
-        if not decode_apk(input_apk, decoded_dir):
+        if is_bundle:
+            base_apk, splits = extract_bundle(input_apk, bundle_dir)
+            if not base_apk:
+                cleanup_files()
+                sys.exit(1)
+            target_apk = base_apk
+        else:
+            target_apk = input_apk
+        
+        if not decode_apk(target_apk, decoded_dir):
             sys.exit(1)
         
         remove_pairip_smali(decoded_dir)
@@ -272,7 +380,16 @@ def main():
             cleanup_files()
             sys.exit(1)
         
-        os.rename(signed_apk, output_apk)
+        if is_bundle:
+            if splits and not sign_splits(splits):
+                print(colored("[-] Failed to sign bundle splits", "red"))
+                cleanup_files()
+                sys.exit(1)
+            if not repack_bundle(bundle_dir, base_apk, signed_apk, output_apk):
+                cleanup_files()
+                sys.exit(1)
+        else:
+            os.rename(signed_apk, output_apk)
         
         cleanup_files(output_apk)
         

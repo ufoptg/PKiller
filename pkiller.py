@@ -91,28 +91,86 @@ def decode_apk(apk_path, output_dir):
     cmd = ['apkeditor', 'd', '-i', apk_path, '-o', output_dir]
     return run_with_spinner(cmd, "APK decoded", "Decode failed")
 
+def get_pairip_application_super(decoded_dir):
+    """If <application android:name> points at a pairip wrapper class, find the
+    real app Application class (the wrapper's .super) before pairip smali is
+    removed. Returns (old_name, real_app_dotted) or None."""
+    manifest_path = os.path.join(decoded_dir, 'AndroidManifest.xml')
+    if not os.path.exists(manifest_path):
+        return None
+    with open(manifest_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    app_tag = re.search(r'<application\b(.*?)>', content, re.DOTALL)
+    if not app_tag:
+        return None
+    name_m = re.search(r'android:name="([^"]*)"', app_tag.group(1))
+    if not name_m:
+        return None
+    name = name_m.group(1)
+    if 'pairip' not in name.lower():
+        return None
+
+    def find_super(class_name):
+        smali_rel = class_name.replace('.', '/') + '.smali'
+        candidates = (glob.glob(os.path.join(decoded_dir, 'smali*', smali_rel)) +
+                      glob.glob(os.path.join(decoded_dir, 'smali', 'classes*', smali_rel)))
+        for candidate in sorted(candidates):
+            with open(candidate, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('.super '):
+                        return line[len('.super '):].strip()
+        return None
+
+    current = name
+    for _ in range(6):
+        super_sig = find_super(current)
+        if super_sig is None or not (super_sig.startswith('L') and super_sig.endswith(';')):
+            print(colored(f"[*] Could not resolve real Application class for {current}", "white"))
+            return None
+        internal = super_sig[1:-1]
+        if 'pairip' not in internal.lower():
+            dotted = internal.replace('/', '.')
+            print(colored(f"[*] Pairip Application wrapper detected: {name} -> {dotted}", "white"))
+            return name, dotted
+        current = internal
+    print(colored(f"[*] Could not resolve real Application class for {name}", "white"))
+    return None
+
 def remove_pairip_smali(decoded_dir):
     print(colored("\n[2/5] Removing PairIP files...", "white"))
-    pairip_path = os.path.join(decoded_dir, "smali/classes/com/pairip")
-    if os.path.exists(pairip_path):
-        shutil.rmtree(pairip_path)
-        print(colored("  [+] Removed PairIP smali directory", "green"))
-    else:
-        found = False
-        smali_dir = os.path.join(decoded_dir, "smali/classes")
-        if os.path.exists(smali_dir):
-            for root, dirs, files in os.walk(smali_dir):
-                for dir_name in dirs:
-                    if 'pairip' in dir_name.lower() or 'license' in dir_name.lower():
-                        dir_path = os.path.join(root, dir_name)
-                        shutil.rmtree(dir_path)
-                        found = True
-                        print(colored(f"  [+] Removed: {dir_name}", "green"))
-        if not found:
-            print(colored("  [*] No PairIP directories found", "white"))
+    found = False
+    for scan_dir in sorted(_smali_dirs(decoded_dir)):
+        pairip_path = os.path.join(scan_dir, "com/pairip")
+        if os.path.exists(pairip_path):
+            shutil.rmtree(pairip_path)
+            print(colored(f"  [+] Removed PairIP smali directory ({os.path.relpath(scan_dir, decoded_dir)})", "green"))
+            found = True
+        for root, dirs, files in os.walk(scan_dir):
+            for dir_name in list(dirs):
+                if 'pairip' in dir_name.lower() or 'license' in dir_name.lower():
+                    dir_path = os.path.join(root, dir_name)
+                    shutil.rmtree(dir_path)
+                    dirs.remove(dir_name)
+                    found = True
+                    print(colored(f"  [+] Removed: {dir_name}", "green"))
+    if not found:
+        print(colored("  [*] No PairIP directories found", "white"))
     return True
 
-def clean_manifest(decoded_dir):
+def _smali_dirs(decoded_dir):
+    """All code directories: smali/classes*, plus legacy smali/ layouts."""
+    dirs = []
+    for smali_root in sorted(glob.glob(os.path.join(decoded_dir, 'smali*'))):
+        classes_dirs = sorted(glob.glob(os.path.join(smali_root, 'classes*')))
+        if classes_dirs:
+            dirs.extend(classes_dirs)
+        else:
+            dirs.append(smali_root)
+    return dirs
+
+
+def clean_manifest(decoded_dir, pairip_app=None):
     print(colored("\n[3/5] Cleaning AndroidManifest.xml...", "white"))
     manifest_path = os.path.join(decoded_dir, "AndroidManifest.xml")
     if not os.path.exists(manifest_path):
@@ -137,6 +195,18 @@ def clean_manifest(decoded_dir):
     
     with open(manifest_path, 'w', encoding='utf-8') as f:
         f.write(content)
+    
+    if pairip_app:
+        old_name, new_name = pairip_app
+        replaced = len(re.findall(rf'android:name="{re.escape(old_name)}"', content))
+        if replaced:
+            content = re.sub(rf'android:name="{re.escape(old_name)}"',
+                             f'android:name="{new_name}"', content)
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(colored(f"  [+] Restored real Application class: {new_name}", "green"))
+        else:
+            print(colored(f"[*] Pairip application class {old_name} not found in manifest", "white"))
     
     stop_spinner_thread()
     print(colored(f"  [+] Removed {removed_count} PairIP entries", "green"))
@@ -366,8 +436,9 @@ def main():
         if not decode_apk(target_apk, decoded_dir):
             sys.exit(1)
         
+        pairip_app = get_pairip_application_super(decoded_dir)
         remove_pairip_smali(decoded_dir)
-        clean_manifest(decoded_dir)
+        clean_manifest(decoded_dir, pairip_app)
         
         temp_apk = os.path.join(os.getcwd(), "temp_rebuilt.apk")
         if not rebuild_apk(decoded_dir, temp_apk):
